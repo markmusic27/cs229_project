@@ -1,0 +1,11 @@
+{
+  "train": [
+    "lighthouse_og.png",
+    "camel_og.png",
+    "river_og.png"
+  ],
+  "val": [],
+  "test": [
+    "budi_og.png"
+  ]
+}
