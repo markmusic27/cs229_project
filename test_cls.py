@@ -108,8 +108,8 @@ def extract_clip_cls_embedding(image: Image.Image, device, dtype):
 
 
 def run_cls_conditioned_img2img(
-    original_path: str = "dataset/budi_og.png",
-    compressed_path: str = "dataset/budi_comp.png",
+    original_path: str = "dataset/camel_og.png",
+    compressed_path: str = "dataset/camel_comp.png",
     output_dir: str = "test_cls_results",
     prompt: str = "a high quality photograph",
     negative_prompt: str = "blurry, low quality, distorted, noise, artifacts",
