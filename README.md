@@ -1,1 +1,3 @@
 uv run python src/data_pipeline/generate_training_data.py --input dataset
+
+test from h100
