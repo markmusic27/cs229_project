@@ -6,27 +6,29 @@ This script trains a LoRA adapter to improve image reconstruction
 from VAE-compressed inputs.
 
 Usage:
-    uv run python scripts/train_lora.py --data training_data
+    uv run python src/training_pipeline/train.py --data training_data
     
     # With custom settings:
-    uv run python scripts/train_lora.py --data training_data --epochs 50 --lr 1e-4
+    uv run python src/training_pipeline/train.py --data training_data --epochs 50 --lr 1e-5
     
     # Resume from checkpoint:
-    uv run python scripts/train_lora.py --data training_data --resume lora_output/checkpoint-20
+    uv run python src/training_pipeline/train.py --data training_data --resume lora_output/checkpoint-20
 """
 
 import argparse
 import json
+import math
 import os
 import random
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.amp import autocast, GradScaler
 from PIL import Image
 from tqdm import tqdm
 from diffusers import StableDiffusionXLImg2ImgPipeline, DDIMScheduler
@@ -40,12 +42,13 @@ class TrainingConfig:
     data_dir: str = "training_data"
     output_dir: str = "lora_output"
     
-    # Training
+    # Training - LOWER default LR for stability
     num_epochs: int = 100
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-5  # Changed from 1e-4 to 1e-5
     weight_decay: float = 0.01
     gradient_clip: float = 1.0
     seed: int = 42
+    warmup_epochs: int = 5  # NEW: warmup period
     
     # LoRA
     lora_rank: int = 32
@@ -82,6 +85,7 @@ class TrainingMetrics:
     epoch_time: float
     total_time: float
     best_val_loss: float
+    nan_count: int = 0  # Track NaN occurrences
     
     def to_dict(self) -> dict:
         return asdict(self)
@@ -115,15 +119,20 @@ class TrainingLogger:
         print(f"  Epoch Time:      {metrics.epoch_time:.1f}s")
         print(f"  Total Time:      {metrics.total_time/60:.1f}min")
         print(f"  Best Val Loss:   {metrics.best_val_loss:.6f}")
+        if metrics.nan_count > 0:
+            print(f"  NaN Skipped:     {metrics.nan_count}")
         print("=" * 70)
     
     def save_summary(self, config: TrainingConfig):
         """Save final training summary."""
+        valid_losses = [m["train_loss"] for m in self.metrics_history if not math.isnan(m["train_loss"])]
+        valid_val_losses = [m["val_loss"] for m in self.metrics_history if m["val_loss"] is not None and not math.isnan(m["val_loss"])]
+        
         summary = {
             "config": asdict(config),
             "metrics_history": self.metrics_history,
-            "final_train_loss": self.metrics_history[-1]["train_loss"] if self.metrics_history else None,
-            "best_val_loss": min([m["val_loss"] for m in self.metrics_history if m["val_loss"] is not None], default=None),
+            "final_train_loss": valid_losses[-1] if valid_losses else None,
+            "best_val_loss": min(valid_val_losses) if valid_val_losses else None,
             "total_epochs": len(self.metrics_history),
             "timestamp": datetime.now().isoformat(),
         }
@@ -163,42 +172,75 @@ def compute_loss(
     add_time_ids: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
-) -> torch.Tensor:
-    """Compute training loss for a single image pair."""
+    use_amp: bool = True,
+) -> Tuple[torch.Tensor, bool]:
+    """
+    Compute training loss for a single image pair.
+    
+    Returns:
+        Tuple of (loss tensor, is_valid) where is_valid is False if NaN detected
+    """
     
     # Load images
     original = Image.open(original_path).convert("RGB")
-    compressed = Image.open(compressed_path).convert("RGB")
     
-    # Preprocess
-    original_tensor = pipe.image_processor.preprocess(original).to(device, dtype)
+    # Preprocess - use float32 for more stable encoding
+    original_tensor = pipe.image_processor.preprocess(original).to(device, torch.float32)
     
     with torch.no_grad():
-        # Encode original to latents (target)
+        # Encode in float32 for stability, then convert
         original_latents = pipe.vae.encode(original_tensor).latent_dist.sample()
         original_latents = original_latents * pipe.vae.config.scaling_factor
+        original_latents = original_latents.to(dtype)
+        
+        # Check for NaN in latents
+        if torch.isnan(original_latents).any():
+            print(f"  Warning: NaN in latents for {original_path}")
+            return torch.tensor(0.0, device=device), False
     
-    # Sample random timestep
-    timesteps = torch.randint(0, 1000, (1,), device=device).long()
+    # Sample random timestep (avoid very high timesteps which can be unstable)
+    timesteps = torch.randint(0, 800, (1,), device=device).long()  # Reduced from 1000
     
-    # Add noise to original
+    # Add noise
     noise = torch.randn_like(original_latents)
     noisy_latents = pipe.scheduler.add_noise(original_latents, noise, timesteps)
     
-    # Predict noise
-    noise_pred = pipe.unet(
-        noisy_latents,
-        timesteps,
-        encoder_hidden_states=prompt_embeds,
-        added_cond_kwargs={
-            "text_embeds": pooled_prompt_embeds,
-            "time_ids": add_time_ids,
-        },
-    ).sample
+    # Clamp noisy latents for stability
+    noisy_latents = torch.clamp(noisy_latents, -30, 30)
     
-    # MSE loss
-    loss = F.mse_loss(noise_pred, noise)
-    return loss
+    # Forward pass with optional AMP
+    if use_amp and device.type == "cuda":
+        with autocast(device_type="cuda"):
+            noise_pred = pipe.unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=prompt_embeds,
+                added_cond_kwargs={
+                    "text_embeds": pooled_prompt_embeds,
+                    "time_ids": add_time_ids,
+                },
+            ).sample
+            
+            # MSE loss
+            loss = F.mse_loss(noise_pred.float(), noise.float())
+    else:
+        noise_pred = pipe.unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=prompt_embeds,
+            added_cond_kwargs={
+                "text_embeds": pooled_prompt_embeds,
+                "time_ids": add_time_ids,
+            },
+        ).sample
+        
+        loss = F.mse_loss(noise_pred.float(), noise.float())
+    
+    # Check for NaN loss
+    if torch.isnan(loss) or torch.isinf(loss):
+        return loss, False
+    
+    return loss, True
 
 
 def validate(
@@ -213,24 +255,28 @@ def validate(
     """Compute validation loss."""
     pipe.unet.eval()
     total_loss = 0
+    valid_count = 0
     
     with torch.no_grad():
         for pair in val_pairs:
-            loss = compute_loss(
+            loss, is_valid = compute_loss(
                 pipe, pair["original"], pair["compressed"],
                 prompt_embeds, pooled_prompt_embeds, add_time_ids,
-                device, dtype
+                device, dtype, use_amp=False  # No AMP for validation
             )
-            total_loss += loss.item()
+            if is_valid:
+                total_loss += loss.item()
+                valid_count += 1
     
     pipe.unet.train()
-    return total_loss / len(val_pairs) if val_pairs else 0
+    return total_loss / valid_count if valid_count > 0 else float("nan")
 
 
 def save_checkpoint(
     pipe,
     optimizer,
     scheduler,
+    scaler,
     epoch: int,
     config: TrainingConfig,
     metrics: TrainingMetrics,
@@ -250,6 +296,7 @@ def save_checkpoint(
         "epoch": epoch,
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler else None,
         "metrics": metrics.to_dict(),
     }, checkpoint_dir / "training_state.pt")
     
@@ -264,6 +311,7 @@ def load_checkpoint(
     pipe,
     optimizer,
     scheduler,
+    scaler,
     checkpoint_dir: str,
     device: torch.device,
 ):
@@ -282,9 +330,22 @@ def load_checkpoint(
         state = torch.load(state_path, map_location=device)
         optimizer.load_state_dict(state["optimizer_state_dict"])
         scheduler.load_state_dict(state["scheduler_state_dict"])
+        if scaler and state.get("scaler_state_dict"):
+            scaler.load_state_dict(state["scaler_state_dict"])
         return state["epoch"], state.get("metrics", {})
     
     return 0, {}
+
+
+def get_lr_with_warmup(epoch: int, warmup_epochs: int, base_lr: float, total_epochs: int) -> float:
+    """Calculate learning rate with warmup."""
+    if epoch < warmup_epochs:
+        # Linear warmup
+        return base_lr * (epoch + 1) / warmup_epochs
+    else:
+        # Cosine decay after warmup
+        progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+        return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
 
 
 def train(config: TrainingConfig, resume_from: str = None):
@@ -299,6 +360,7 @@ def train(config: TrainingConfig, resume_from: str = None):
     print(f"  Output directory:  {config.output_dir}")
     print(f"  Epochs:            {config.num_epochs}")
     print(f"  Learning rate:     {config.learning_rate}")
+    print(f"  Warmup epochs:     {config.warmup_epochs}")
     print(f"  LoRA rank:         {config.lora_rank}")
     print(f"  Save every:        {config.save_every} epochs")
     print(f"  Validate every:    {config.validate_every} epochs")
@@ -307,9 +369,11 @@ def train(config: TrainingConfig, resume_from: str = None):
     torch.manual_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
+    use_amp = device.type == "cuda"
     
     print(f"\nDevice: {device}")
     print(f"Dtype: {dtype}")
+    print(f"Mixed Precision: {use_amp}")
     
     # Load training data
     print("\nLoading training data...")
@@ -333,8 +397,8 @@ def train(config: TrainingConfig, resume_from: str = None):
     )
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     
-    # Move components to device
-    pipe.vae.to(device)
+    # Move VAE to float32 for stable encoding
+    pipe.vae.to(device, dtype=torch.float32)
     if pipe.text_encoder:
         pipe.text_encoder.to(device)
     if pipe.text_encoder_2:
@@ -347,7 +411,6 @@ def train(config: TrainingConfig, resume_from: str = None):
         lora_alpha=config.lora_alpha,
         target_modules=[
             "to_q", "to_k", "to_v", "to_out.0",  # Attention
-            "ff.net.0.proj", "ff.net.2",          # FFN (if available)
         ],
         lora_dropout=config.lora_dropout,
     )
@@ -361,33 +424,42 @@ def train(config: TrainingConfig, resume_from: str = None):
     print(f"  Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
     print(f"  Total params:     {total_params:,}")
     
-    # Optimizer and scheduler
+    # Optimizer with lower epsilon for stability
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, pipe.unet.parameters()),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
+        eps=1e-8,
     )
     
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # LR scheduler with warmup
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        T_max=config.num_epochs,
-        eta_min=config.learning_rate / 100,
+        lr_lambda=lambda epoch: get_lr_with_warmup(
+            epoch, config.warmup_epochs, 1.0, config.num_epochs
+        )
     )
+    
+    # Gradient scaler for mixed precision
+    scaler = GradScaler() if use_amp else None
     
     # Resume from checkpoint if specified
     start_epoch = 0
     if resume_from:
         print(f"\nResuming from checkpoint: {resume_from}")
-        start_epoch, _ = load_checkpoint(pipe, optimizer, lr_scheduler, resume_from, device)
+        start_epoch, _ = load_checkpoint(pipe, optimizer, lr_scheduler, scaler, resume_from, device)
         print(f"  Resuming from epoch {start_epoch + 1}")
     
-    # Encode prompt once
+    # Encode prompt once - in float32 for stability
     print("\nEncoding prompt...")
     with torch.no_grad():
         prompt_embeds, _, pooled_prompt_embeds, _ = pipe.encode_prompt(
             prompt=config.prompt,
             device=device,
         )
+        # Keep embeddings in float16 for UNet
+        prompt_embeds = prompt_embeds.to(dtype)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(dtype)
     
     # Time IDs for SDXL
     add_time_ids = torch.tensor(
@@ -409,6 +481,8 @@ def train(config: TrainingConfig, resume_from: str = None):
     
     best_val_loss = float("inf")
     start_time = time.time()
+    consecutive_nan = 0
+    max_consecutive_nan = 10  # Stop if too many NaN in a row
     
     for epoch in range(start_epoch, config.num_epochs):
         epoch_start = time.time()
@@ -419,25 +493,54 @@ def train(config: TrainingConfig, resume_from: str = None):
         
         # Training epoch
         epoch_loss = 0
+        valid_batches = 0
+        nan_count = 0
+        
         pbar = tqdm(train_pairs, desc=f"Epoch {epoch+1}/{config.num_epochs}")
         
         for pair in pbar:
-            loss = compute_loss(
+            optimizer.zero_grad()
+            
+            # Compute loss
+            loss, is_valid = compute_loss(
                 pipe, pair["original"], pair["compressed"],
                 prompt_embeds, pooled_prompt_embeds, add_time_ids,
-                device, dtype
+                device, dtype, use_amp=use_amp
             )
             
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(pipe.unet.parameters(), config.gradient_clip)
-            optimizer.step()
+            if not is_valid:
+                nan_count += 1
+                consecutive_nan += 1
+                pbar.set_postfix({"loss": "NaN", "skipped": nan_count})
+                
+                if consecutive_nan >= max_consecutive_nan:
+                    print(f"\n\nERROR: {max_consecutive_nan} consecutive NaN losses!")
+                    print("Training is unstable. Try:")
+                    print("  1. Lower learning rate: --lr 1e-6")
+                    print("  2. Check your training images for corruption")
+                    return
+                continue
+            
+            consecutive_nan = 0  # Reset counter on valid loss
+            
+            # Backward pass with gradient scaling
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(pipe.unet.parameters(), config.gradient_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(pipe.unet.parameters(), config.gradient_clip)
+                optimizer.step()
             
             epoch_loss += loss.item()
+            valid_batches += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         
         # Compute average training loss
-        avg_train_loss = epoch_loss / len(train_pairs)
+        avg_train_loss = epoch_loss / valid_batches if valid_batches > 0 else float("nan")
         
         # Validation
         val_loss = None
@@ -449,20 +552,21 @@ def train(config: TrainingConfig, resume_from: str = None):
                 device, dtype
             )
             
-            if val_loss < best_val_loss:
+            if not math.isnan(val_loss) and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 # Save best model
                 save_checkpoint(
-                    pipe, optimizer, lr_scheduler,
+                    pipe, optimizer, lr_scheduler, scaler,
                     epoch + 1, config,
                     TrainingMetrics(
                         epoch=epoch + 1,
                         train_loss=avg_train_loss,
                         val_loss=val_loss,
-                        learning_rate=lr_scheduler.get_last_lr()[0],
+                        learning_rate=optimizer.param_groups[0]["lr"],
                         epoch_time=time.time() - epoch_start,
                         total_time=time.time() - start_time,
                         best_val_loss=best_val_loss,
+                        nan_count=nan_count,
                     ),
                     config.output_dir,
                     name="best"
@@ -474,7 +578,7 @@ def train(config: TrainingConfig, resume_from: str = None):
         # Compute metrics
         epoch_time = time.time() - epoch_start
         total_time = time.time() - start_time
-        current_lr = lr_scheduler.get_last_lr()[0]
+        current_lr = optimizer.param_groups[0]["lr"]
         
         metrics = TrainingMetrics(
             epoch=epoch + 1,
@@ -484,6 +588,7 @@ def train(config: TrainingConfig, resume_from: str = None):
             epoch_time=epoch_time,
             total_time=total_time,
             best_val_loss=best_val_loss if best_val_loss != float("inf") else avg_train_loss,
+            nan_count=nan_count,
         )
         
         # Log and print
@@ -493,7 +598,7 @@ def train(config: TrainingConfig, resume_from: str = None):
         # Save checkpoint
         if (epoch + 1) % config.save_every == 0:
             save_checkpoint(
-                pipe, optimizer, lr_scheduler,
+                pipe, optimizer, lr_scheduler, scaler,
                 epoch + 1, config, metrics,
                 config.output_dir
             )
@@ -507,14 +612,15 @@ def train(config: TrainingConfig, resume_from: str = None):
         epoch=config.num_epochs,
         train_loss=avg_train_loss,
         val_loss=val_loss,
-        learning_rate=lr_scheduler.get_last_lr()[0],
+        learning_rate=optimizer.param_groups[0]["lr"],
         epoch_time=epoch_time,
         total_time=time.time() - start_time,
         best_val_loss=best_val_loss if best_val_loss != float("inf") else avg_train_loss,
+        nan_count=nan_count,
     )
     
     save_checkpoint(
-        pipe, optimizer, lr_scheduler,
+        pipe, optimizer, lr_scheduler, scaler,
         config.num_epochs, config, final_metrics,
         config.output_dir,
         name="final"
@@ -530,7 +636,8 @@ def train(config: TrainingConfig, resume_from: str = None):
     print(f"\nFinal Results:")
     print(f"  Total epochs:      {config.num_epochs}")
     print(f"  Final train loss:  {avg_train_loss:.6f}")
-    print(f"  Best val loss:     {best_val_loss:.6f}" if best_val_loss != float("inf") else "  Best val loss:     N/A")
+    if best_val_loss != float("inf"):
+        print(f"  Best val loss:     {best_val_loss:.6f}")
     print(f"  Total time:        {(time.time() - start_time)/60:.1f} minutes")
     print(f"\nOutput files:")
     print(f"  {config.output_dir}/")
@@ -550,17 +657,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Basic training
-    uv run python scripts/train_lora.py --data training_data
+    # Basic training (uses stable defaults)
+    uv run python src/training_pipeline/train.py --data training_data
 
     # Custom epochs and learning rate
-    uv run python scripts/train_lora.py --data training_data --epochs 50 --lr 5e-5
+    uv run python src/training_pipeline/train.py --data training_data --epochs 50 --lr 1e-5
 
     # Resume from checkpoint
-    uv run python scripts/train_lora.py --data training_data --resume lora_output/checkpoint-20
+    uv run python src/training_pipeline/train.py --data training_data --resume lora_output/checkpoint-20
 
     # Higher LoRA rank for more capacity
-    uv run python scripts/train_lora.py --data training_data --rank 64
+    uv run python src/training_pipeline/train.py --data training_data --rank 64
         """
     )
     
@@ -570,14 +677,16 @@ Examples:
                         help="Output directory (default: lora_output)")
     parser.add_argument("--epochs", type=int, default=100,
                         help="Number of epochs (default: 100)")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Learning rate (default: 1e-4)")
+    parser.add_argument("--lr", type=float, default=1e-5,
+                        help="Learning rate (default: 1e-5)")
     parser.add_argument("--rank", type=int, default=32,
                         help="LoRA rank (default: 32)")
     parser.add_argument("--save-every", type=int, default=20,
                         help="Save checkpoint every N epochs (default: 20)")
     parser.add_argument("--val-every", type=int, default=10,
                         help="Validate every N epochs (default: 10)")
+    parser.add_argument("--warmup", type=int, default=5,
+                        help="Warmup epochs (default: 5)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
     parser.add_argument("--resume", type=str, default=None,
@@ -596,6 +705,7 @@ Examples:
         lora_alpha=args.rank,
         save_every=args.save_every,
         validate_every=args.val_every,
+        warmup_epochs=args.warmup,
         seed=args.seed,
         prompt=args.prompt,
     )
@@ -605,4 +715,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-
