@@ -29,6 +29,8 @@ class Img2ImgConfig:
         use_ilvr: Whether to apply ILVR guidance during denoising.
         down_factor: ILVR downsampling factor (higher = less constraint).
         stop_step: Step index to stop applying ILVR.
+        use_cls_conditioning: Whether to use CLS token conditioning (requires cls_embedding).
+        ip_adapter_scale: Scale for IP-Adapter when using CLS conditioning.
     """
     
     # Generation parameters
@@ -46,6 +48,10 @@ class Img2ImgConfig:
     use_ilvr: bool = False
     down_factor: int = 4
     stop_step: int = 50
+    
+    # CLS conditioning parameters (optional)
+    use_cls_conditioning: bool = False
+    ip_adapter_scale: float = 0.6
     
     def __post_init__(self):
         """Validate configuration values."""

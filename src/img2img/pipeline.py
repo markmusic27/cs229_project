@@ -19,20 +19,27 @@ from .visualization import create_comparison_grid
 
 class Img2ImgPipeline:
     """
-    Img2Img pipeline with optional ILVR guidance.
+    Img2Img pipeline with optional ILVR guidance and CLS conditioning.
     
     Starts diffusion from a reference image instead of pure noise,
     allowing iterative refinement while preserving structure.
     
     Example:
+        # Basic usage
         pipeline = Img2ImgPipeline()
         pipeline.load_reference("photo.jpg")
-        
-        # Single generation
         image = pipeline.generate()
         
-        # Iterative refinement
-        images = pipeline.generate_iterations()
+        # With CLS conditioning (requires quantized CLS from sender)
+        from img2img.encoding import dequantize_cls, QuantizedCLS
+        
+        quantized = QuantizedCLS.from_bytes(received_bytes)
+        cls_embedding = dequantize_cls(quantized)
+        
+        config = Img2ImgConfig(use_cls_conditioning=True)
+        pipeline = Img2ImgPipeline(config=config)
+        pipeline.load_reference("compressed.jpg")
+        image = pipeline.generate(cls_embedding=cls_embedding)
     """
     
     def __init__(
@@ -61,6 +68,7 @@ class Img2ImgPipeline:
         
         self.pipe: Optional[StableDiffusionXLImg2ImgPipeline] = None
         self.reference_image: Optional[Image.Image] = None
+        self._ip_adapter_loaded: bool = False
         
         if load_model:
             self.load_model()
@@ -83,8 +91,27 @@ class Img2ImgPipeline:
         except Exception:
             pass
         
+        # Load IP-Adapter if CLS conditioning is enabled
+        if self.config.use_cls_conditioning:
+            self._load_ip_adapter()
+        
         print("Model loaded successfully")
         return self
+    
+    def _load_ip_adapter(self) -> None:
+        """Load IP-Adapter for CLS conditioning."""
+        if self._ip_adapter_loaded:
+            return
+        
+        print("Loading IP-Adapter for CLS conditioning...")
+        self.pipe.load_ip_adapter(
+            "h94/IP-Adapter",
+            subfolder="sdxl_models",
+            weight_name="ip-adapter_sdxl.bin",
+        )
+        self.pipe.set_ip_adapter_scale(self.config.ip_adapter_scale)
+        self._ip_adapter_loaded = True
+        print(f"IP-Adapter loaded with scale={self.config.ip_adapter_scale}")
     
     def load_reference(self, image: Union[str, Path, Image.Image]) -> "Img2ImgPipeline":
         """
@@ -112,6 +139,7 @@ class Img2ImgPipeline:
         config: Optional[Img2ImgConfig] = None,
         image: Optional[Image.Image] = None,
         seed_offset: int = 0,
+        cls_embedding: Optional[torch.Tensor] = None,
     ) -> Image.Image:
         """
         Generate a single image.
@@ -120,6 +148,8 @@ class Img2ImgPipeline:
             config: Override config for this generation.
             image: Input image. Uses reference if None.
             seed_offset: Offset to add to seed.
+            cls_embedding: Optional CLS embedding for conditioning (from dequantize_cls).
+                           Required if use_cls_conditioning=True.
         
         Returns:
             Generated PIL Image.
@@ -132,6 +162,16 @@ class Img2ImgPipeline:
         
         if input_image is None:
             raise RuntimeError("No input image. Call load_reference() or provide image.")
+        
+        # Validate CLS conditioning
+        if cfg.use_cls_conditioning:
+            if cls_embedding is None:
+                raise ValueError(
+                    "cls_embedding is required when use_cls_conditioning=True. "
+                    "Use extract_and_quantize_cls() on sender side and dequantize_cls() on receiver side."
+                )
+            if not self._ip_adapter_loaded:
+                self._load_ip_adapter()
         
         # Setup generator
         seed = cfg.seed + seed_offset
@@ -155,10 +195,20 @@ class Img2ImgPipeline:
             )
             callback_inputs = ["latents"]
         
-        print(f"Generating: strength={cfg.strength}, steps={cfg.num_inference_steps}, "
-              f"guidance={cfg.guidance_scale}, ilvr={cfg.use_ilvr}")
+        # Prepare CLS embedding for IP-Adapter if enabled
+        ip_adapter_embeds = None
+        if cfg.use_cls_conditioning and cls_embedding is not None:
+            # IP-Adapter expects [negative, positive] concatenated along batch dim
+            negative_cls = torch.zeros_like(cls_embedding)
+            cls_combined = torch.cat([negative_cls, cls_embedding], dim=0)
+            # Add sequence dimension: (2, 1, 1280)
+            ip_adapter_embeds = [cls_combined.unsqueeze(1)]
         
-        result = self.pipe(
+        print(f"Generating: strength={cfg.strength}, steps={cfg.num_inference_steps}, "
+              f"guidance={cfg.guidance_scale}, ilvr={cfg.use_ilvr}, cls={cfg.use_cls_conditioning}")
+        
+        # Build pipeline kwargs
+        pipe_kwargs = dict(
             prompt=cfg.prompt,
             negative_prompt=cfg.negative_prompt,
             image=input_image,
@@ -170,12 +220,19 @@ class Img2ImgPipeline:
             callback_on_step_end_tensor_inputs=callback_inputs,
         )
         
+        # Add CLS conditioning if enabled
+        if ip_adapter_embeds is not None:
+            pipe_kwargs["ip_adapter_image_embeds"] = ip_adapter_embeds
+        
+        result = self.pipe(**pipe_kwargs)
+        
         return result.images[0]
     
     def generate_iterations(
         self,
         config: Optional[Img2ImgConfig] = None,
         output_dir: Optional[str] = None,
+        cls_embedding: Optional[torch.Tensor] = None,
     ) -> List[Image.Image]:
         """
         Generate multiple iterations, using each output as next input.
@@ -183,6 +240,8 @@ class Img2ImgPipeline:
         Args:
             config: Override config for this generation.
             output_dir: Directory to save intermediate results.
+            cls_embedding: Optional CLS embedding for conditioning (from dequantize_cls).
+                           Required if use_cls_conditioning=True.
         
         Returns:
             List of all images (including original reference).
@@ -211,7 +270,12 @@ class Img2ImgPipeline:
             print(f"Iteration {i}/{cfg.iterations}")
             print(f"{'='*60}")
             
-            output = self.generate(config=cfg, image=current_image, seed_offset=i)
+            output = self.generate(
+                config=cfg,
+                image=current_image,
+                seed_offset=i,
+                cls_embedding=cls_embedding,
+            )
             
             all_images.append(output.copy())
             all_labels.append(f"Iteration {i}")
