@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-Img2Img without CLS conditioning (basic usage).
+Simple VAE compression cycle.
+Usage: python main.py <input_image> <output_image>
 """
 
-from img2img import Img2ImgConfig, Img2ImgPipeline
+import sys
+from vae import VAE
 
 
-def main():
-    # Configure (no CLS - use_cls_conditioning defaults to False)
-    config = Img2ImgConfig(
-        strength=0.3,
-        guidance_scale=3.0,
-        num_inference_steps=100,
-        iterations=5,
-    )
-
-    # Create pipeline and load reference image
-    pipeline = Img2ImgPipeline(config=config)
-    pipeline.load_reference("dataset/camel_comp.png")
-
-    # Generate iterations (no cls_embedding needed)
-    images = pipeline.generate_iterations(output_dir="img2img_results")
+def compress_image(input_path: str, output_path: str):
+    """Run a full VAE compression cycle: encode → quantize → pack → unpack → decode"""
+    vae = VAE()
+    image_tensor, original_size = vae.load_image(input_path)
+    packed, latent_min, latent_max, original_shape = vae.encode_and_pack(image_tensor)
+    vae.unpack_and_decode(packed, original_shape, latent_min, latent_max, original_size, output_path)
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 3:
+        print("Usage: python main.py <input_image> <output_image>")
+        print("Example: python main.py photo.jpg compressed_output.png")
+        sys.exit(1)
+
+    input_path = sys.argv[1]
+    output_path = sys.argv[2]
+
+    compress_image(input_path, output_path)
