@@ -1,27 +1,29 @@
-from ilvr.config import ILVRConfig
-from ilvr.pipeline import ILVRPipeline
+#!/usr/bin/env python3
+"""
+Img2Img ILVR example usage.
+"""
+
+from img2img import Img2ImgConfig, Img2ImgPipeline
 
 
 def main():
-
-    # Initialize with custom config
-    config = ILVRConfig(
-        down_factor=1,
-        stop_step=50,
+    # Configure with your hyperparameters
+    config = Img2ImgConfig(
+        strength=0.3,
+        guidance_scale=3.0,
         num_inference_steps=100,
-        guidance_scale=0,
+        iterations=5,
+        use_ilvr=False,  # Matches img2img.py default (no --use_ilvr flag)
+        down_factor=4,
+        stop_step=50,
     )
-    pipeline = ILVRPipeline(config=config)
 
-    # Load reference image
-    pipeline.load_reference("dataset/universe.png")
+    # Create pipeline and load reference
+    pipeline = Img2ImgPipeline(config=config)
+    pipeline.load_reference("dataset/cuevase.png")
 
-    # Generate with comparison (returns tuple)
-    image, comparison = pipeline.generate(return_comparison=True)
-
-
-    # Save image
-    pipeline.save(image, "output.png", save_comparison=True)
+    # Generate iterations (saves to output dir)
+    images = pipeline.generate_iterations(output_dir="img2img_results")
 
 
 if __name__ == "__main__":
