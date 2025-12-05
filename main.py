@@ -20,7 +20,7 @@ def main():
 
     # Create pipeline and load reference
     pipeline = Img2ImgPipeline(config=config)
-    pipeline.load_reference("dataset/cuevase.png")
+    pipeline.load_reference("dataset/budi_comp.png")
 
     # Generate iterations (saves to output dir)
     images = pipeline.generate_iterations(output_dir="img2img_results")
