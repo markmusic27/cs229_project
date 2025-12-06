@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 LoRA Training for SDXL Img2Img Compression Reconstruction.
 
@@ -29,6 +28,9 @@ from typing import List, Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
+
+# Disable cuDNN to avoid segfaults in certain environments (gVisor, some container runtimes)
+torch.backends.cudnn.enabled = False
 from PIL import Image
 from tqdm import tqdm
 from diffusers import StableDiffusionXLImg2ImgPipeline, DDIMScheduler
@@ -42,26 +44,31 @@ class TrainingConfig:
     data_dir: str = "training_data"
     output_dir: str = "lora_output"
     
-    # Training - LOWER default LR for stability
+    # Training
     num_epochs: int = 100
-    learning_rate: float = 1e-5  # Changed from 1e-4 to 1e-5
+    learning_rate: float = 1e-5
     weight_decay: float = 0.01
     gradient_clip: float = 1.0
     seed: int = 42
-    warmup_epochs: int = 5  # NEW: warmup period
+    warmup_epochs: int = 5
+    gradient_accumulation_steps: int = 8
     
     # LoRA
     lora_rank: int = 32
-    lora_alpha: int = 32
+    lora_alpha: int = 64
     lora_dropout: float = 0.05
     
     # Checkpointing
     save_every: int = 20
-    validate_every: int = 10
+    validate_every: int = 5
     
     # Model
     model_id: str = "stabilityai/stable-diffusion-xl-base-1.0"
     prompt: str = "a high quality photograph"
+    
+    # Timestep sampling - focus on lower timesteps for img2img
+    num_timestep_buckets: int = 8
+    max_timestep: int = 600  # Lower max since img2img uses lower strengths
     
     def save(self, path: str):
         """Save config to JSON."""
@@ -85,7 +92,7 @@ class TrainingMetrics:
     epoch_time: float
     total_time: float
     best_val_loss: float
-    nan_count: int = 0  # Track NaN occurrences
+    nan_count: int = 0
     
     def to_dict(self) -> dict:
         return asdict(self)
@@ -163,6 +170,26 @@ def load_image_pairs(data_dir: str, split: str) -> List[Dict[str, str]]:
     return pairs
 
 
+def get_stratified_timestep(
+    step: int,
+    num_buckets: int,
+    max_timestep: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Get a timestep using stratified sampling for lower variance.
+    
+    Divides the timestep range into buckets and cycles through them,
+    sampling randomly within each bucket.
+    """
+    bucket = step % num_buckets
+    bucket_size = max_timestep // num_buckets
+    t_min = bucket * bucket_size
+    t_max = min((bucket + 1) * bucket_size, max_timestep)
+    
+    return torch.randint(t_min, t_max, (1,), device=device).long()
+
+
 def compute_loss(
     pipe,
     original_path: str,
@@ -172,41 +199,70 @@ def compute_loss(
     add_time_ids: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    timesteps: torch.Tensor,
     use_amp: bool = True,
 ) -> Tuple[torch.Tensor, bool]:
     """
-    Compute training loss for a single image pair.
+    Compute training loss for compression reconstruction.
     
-    Returns:
-        Tuple of (loss tensor, is_valid) where is_valid is False if NaN detected
+    This version uses BOTH original and compressed images:
+    - Compressed image is the noisy input (what the model sees)
+    - Original image is the target (what we want to reconstruct)
+    
+    The model learns to predict noise that would denoise compressed -> original.
     """
     
-    # Load images
+    # Load BOTH images
     original = Image.open(original_path).convert("RGB")
+    compressed = Image.open(compressed_path).convert("RGB")
     
-    # Preprocess - use float32 for more stable encoding
+    # Preprocess both - use float32 for stable encoding
     original_tensor = pipe.image_processor.preprocess(original).to(device, torch.float32)
+    compressed_tensor = pipe.image_processor.preprocess(compressed).to(device, torch.float32)
     
     with torch.no_grad():
-        # Encode in float32 for stability, then convert
+        # Encode BOTH images to latent space
         original_latents = pipe.vae.encode(original_tensor).latent_dist.sample()
         original_latents = original_latents * pipe.vae.config.scaling_factor
-        original_latents = original_latents.to(dtype)
+        
+        compressed_latents = pipe.vae.encode(compressed_tensor).latent_dist.sample()
+        compressed_latents = compressed_latents * pipe.vae.config.scaling_factor
         
         # Check for NaN in latents
-        if torch.isnan(original_latents).any():
+        if torch.isnan(original_latents).any() or torch.isnan(compressed_latents).any():
             print(f"  Warning: NaN in latents for {original_path}")
             return torch.tensor(0.0, device=device), False
+        
+        original_latents = original_latents.to(dtype)
+        compressed_latents = compressed_latents.to(dtype)
     
-    # Sample random timestep (avoid very high timesteps which can be unstable)
-    timesteps = torch.randint(0, 800, (1,), device=device).long()  # Reduced from 1000
-    
-    # Add noise
+    # Sample random noise
     noise = torch.randn_like(original_latents)
-    noisy_latents = pipe.scheduler.add_noise(original_latents, noise, timesteps)
     
-    # Clamp noisy latents for stability
+    # === KEY CHANGE: Add noise to COMPRESSED latents ===
+    # The model sees: compressed image + noise
+    noisy_latents = pipe.scheduler.add_noise(compressed_latents, noise, timesteps)
     noisy_latents = torch.clamp(noisy_latents, -30, 30)
+    
+    # === KEY CHANGE: Target noise should denoise toward ORIGINAL ===
+    # If we were denoising original, target would just be `noise`
+    # But we want to denoise compressed -> original, so we adjust the target
+    #
+    # The diffusion formula: noisy = sqrt(alpha) * clean + sqrt(1-alpha) * noise
+    # We want the model to predict noise that would give us original, not compressed
+    #
+    # Rearranging: noise_target = (noisy - sqrt(alpha) * original) / sqrt(1-alpha)
+    
+    # Get alpha values for this timestep
+    alphas_cumprod = pipe.scheduler.alphas_cumprod.to(device)
+    alpha_t = alphas_cumprod[timesteps].sqrt().view(-1, 1, 1, 1).to(dtype)
+    sigma_t = (1 - alphas_cumprod[timesteps]).sqrt().view(-1, 1, 1, 1).to(dtype)
+    
+    # Target: the noise that, when removed, gives us the ORIGINAL image
+    # noisy_latents = alpha_t * compressed_latents + sigma_t * noise
+    # We want prediction that satisfies: noisy_latents = alpha_t * original_latents + sigma_t * target
+    # Therefore: target = (noisy_latents - alpha_t * original_latents) / sigma_t
+    target = (noisy_latents - alpha_t * original_latents) / sigma_t.clamp(min=1e-8)
     
     # Forward pass with optional AMP
     if use_amp and device.type == "cuda":
@@ -221,8 +277,8 @@ def compute_loss(
                 },
             ).sample
             
-            # MSE loss
-            loss = F.mse_loss(noise_pred.float(), noise.float())
+            # MSE loss between predicted noise and target
+            loss = F.mse_loss(noise_pred.float(), target.float())
     else:
         noise_pred = pipe.unet(
             noisy_latents,
@@ -234,11 +290,15 @@ def compute_loss(
             },
         ).sample
         
-        loss = F.mse_loss(noise_pred.float(), noise.float())
+        loss = F.mse_loss(noise_pred.float(), target.float())
     
     # Check for NaN loss
     if torch.isnan(loss) or torch.isinf(loss):
         return loss, False
+    
+    # Log high-loss images for debugging
+    if loss.item() > 10.0:
+        print(f"\n  HIGH LOSS: {loss.item():.2f} - {original_path}")
     
     return loss, True
 
@@ -251,6 +311,7 @@ def validate(
     add_time_ids: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    config: TrainingConfig,
 ) -> float:
     """Compute validation loss."""
     pipe.unet.eval()
@@ -258,11 +319,16 @@ def validate(
     valid_count = 0
     
     with torch.no_grad():
-        for pair in val_pairs:
+        for step, pair in enumerate(val_pairs):
+            # Use stratified timesteps for consistent validation
+            timesteps = get_stratified_timestep(
+                step, config.num_timestep_buckets, config.max_timestep, device
+            )
+            
             loss, is_valid = compute_loss(
                 pipe, pair["original"], pair["compressed"],
                 prompt_embeds, pooled_prompt_embeds, add_time_ids,
-                device, dtype, use_amp=False  # No AMP for validation
+                device, dtype, timesteps, use_amp=False
             )
             if is_valid:
                 total_loss += loss.item()
@@ -307,45 +373,15 @@ def save_checkpoint(
     return checkpoint_dir
 
 
-def load_checkpoint(
-    pipe,
-    optimizer,
-    scheduler,
-    scaler,
-    checkpoint_dir: str,
-    device: torch.device,
-):
-    """Load a training checkpoint."""
-    checkpoint_path = Path(checkpoint_dir)
-    
-    # Load LoRA weights
-    lora_path = checkpoint_path / "lora"
-    if lora_path.exists():
-        pipe.unet = PeftModel.from_pretrained(pipe.unet, lora_path)
-        pipe.unet.to(device)
-    
-    # Load training state
-    state_path = checkpoint_path / "training_state.pt"
-    if state_path.exists():
-        state = torch.load(state_path, map_location=device)
-        optimizer.load_state_dict(state["optimizer_state_dict"])
-        scheduler.load_state_dict(state["scheduler_state_dict"])
-        if scaler and state.get("scaler_state_dict"):
-            scaler.load_state_dict(state["scaler_state_dict"])
-        return state["epoch"], state.get("metrics", {})
-    
-    return 0, {}
-
-
 def get_lr_with_warmup(epoch: int, warmup_epochs: int, base_lr: float, total_epochs: int) -> float:
     """Calculate learning rate with warmup."""
     if epoch < warmup_epochs:
         # Linear warmup
-        return base_lr * (epoch + 1) / warmup_epochs
+        return (epoch + 1) / warmup_epochs
     else:
         # Cosine decay after warmup
         progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-        return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+        return 0.5 * (1 + math.cos(math.pi * progress))
 
 
 def train(config: TrainingConfig, resume_from: str = None):
@@ -353,17 +389,23 @@ def train(config: TrainingConfig, resume_from: str = None):
     
     # Setup
     print("\n" + "=" * 70)
-    print("LORA TRAINING FOR SDXL IMG2IMG")
+    print("LORA TRAINING FOR SDXL IMG2IMG - RECONSTRUCTION OBJECTIVE")
     print("=" * 70)
     print(f"\nConfiguration:")
-    print(f"  Data directory:    {config.data_dir}")
-    print(f"  Output directory:  {config.output_dir}")
-    print(f"  Epochs:            {config.num_epochs}")
-    print(f"  Learning rate:     {config.learning_rate}")
-    print(f"  Warmup epochs:     {config.warmup_epochs}")
-    print(f"  LoRA rank:         {config.lora_rank}")
-    print(f"  Save every:        {config.save_every} epochs")
-    print(f"  Validate every:    {config.validate_every} epochs")
+    print(f"  Data directory:           {config.data_dir}")
+    print(f"  Output directory:         {config.output_dir}")
+    print(f"  Epochs:                   {config.num_epochs}")
+    print(f"  Learning rate:            {config.learning_rate}")
+    print(f"  Warmup epochs:            {config.warmup_epochs}")
+    print(f"  Gradient accumulation:    {config.gradient_accumulation_steps}")
+    print(f"  Effective batch size:     {config.gradient_accumulation_steps}")
+    print(f"  LoRA rank:                {config.lora_rank}")
+    print(f"  LoRA alpha:               {config.lora_alpha}")
+    print(f"  Timestep buckets:         {config.num_timestep_buckets}")
+    print(f"  Max timestep:             {config.max_timestep}")
+    print(f"  Save every:               {config.save_every} epochs")
+    print(f"  Validate every:           {config.validate_every} epochs")
+    print(f"\n  ** Using RECONSTRUCTION objective (compressed -> original) **")
     
     # Device setup
     torch.manual_seed(config.seed)
@@ -404,60 +446,103 @@ def train(config: TrainingConfig, resume_from: str = None):
     if pipe.text_encoder_2:
         pipe.text_encoder_2.to(device)
     
-    # Configure LoRA
-    print("\nConfiguring LoRA...")
-    lora_config = LoraConfig(
-        r=config.lora_rank,
-        lora_alpha=config.lora_alpha,
-        target_modules=[
-            "to_q", "to_k", "to_v", "to_out.0",  # Attention
-        ],
-        lora_dropout=config.lora_dropout,
-    )
-    
-    pipe.unet = get_peft_model(pipe.unet, lora_config)
-    pipe.unet.to(device)
-    
-    # Print trainable parameters
-    trainable_params = sum(p.numel() for p in pipe.unet.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in pipe.unet.parameters())
-    print(f"  Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
-    print(f"  Total params:     {total_params:,}")
-    
-    # Optimizer with lower epsilon for stability
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, pipe.unet.parameters()),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-        eps=1e-8,
-    )
-    
-    # LR scheduler with warmup
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda epoch: get_lr_with_warmup(
-            epoch, config.warmup_epochs, 1.0, config.num_epochs
-        )
-    )
-    
     # Gradient scaler for mixed precision
     scaler = GradScaler() if use_amp else None
     
-    # Resume from checkpoint if specified
+    # === FIXED: Handle resume vs fresh start separately ===
     start_epoch = 0
-    if resume_from:
-        print(f"\nResuming from checkpoint: {resume_from}")
-        start_epoch, _ = load_checkpoint(pipe, optimizer, lr_scheduler, scaler, resume_from, device)
-        print(f"  Resuming from epoch {start_epoch + 1}")
     
-    # Encode prompt once - in float32 for stability
+    if resume_from:
+        # RESUMING: Load LoRA from checkpoint (don't wrap with get_peft_model)
+        print(f"\nResuming from checkpoint: {resume_from}")
+        
+        lora_path = Path(resume_from) / "lora"
+        if lora_path.exists():
+            pipe.unet = PeftModel.from_pretrained(pipe.unet, lora_path)
+            pipe.unet.to(device)
+        else:
+            raise FileNotFoundError(f"LoRA weights not found at {lora_path}")
+        
+        # Print trainable parameters
+        trainable_params = sum(p.numel() for p in pipe.unet.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in pipe.unet.parameters())
+        print(f"  Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+        print(f"  Total params:     {total_params:,}")
+        
+        # Create optimizer AFTER loading model
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, pipe.unet.parameters()),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+            eps=1e-8,
+        )
+        
+        # Create LR scheduler
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda epoch: get_lr_with_warmup(
+                epoch, config.warmup_epochs, 1.0, config.num_epochs
+            )
+        )
+        
+        # Load training state
+        state_path = Path(resume_from) / "training_state.pt"
+        if state_path.exists():
+            state = torch.load(state_path, map_location=device)
+            start_epoch = state["epoch"]
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+            lr_scheduler.load_state_dict(state["scheduler_state_dict"])
+            if scaler and state.get("scaler_state_dict"):
+                scaler.load_state_dict(state["scaler_state_dict"])
+            print(f"  Loaded training state from epoch {start_epoch}")
+        
+        print(f"  Resuming from epoch {start_epoch + 1}")
+        
+    else:
+        # FRESH START: Configure LoRA from scratch
+        print("\nConfiguring LoRA...")
+        lora_config = LoraConfig(
+            r=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            target_modules=[
+                "to_q", "to_k", "to_v", "to_out.0",  # Attention
+                "ff.net.0.proj", "ff.net.2",  # Feedforward layers
+            ],
+            lora_dropout=config.lora_dropout,
+        )
+        
+        pipe.unet = get_peft_model(pipe.unet, lora_config)
+        pipe.unet.to(device)
+        
+        # Print trainable parameters
+        trainable_params = sum(p.numel() for p in pipe.unet.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in pipe.unet.parameters())
+        print(f"  Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+        print(f"  Total params:     {total_params:,}")
+        
+        # Create optimizer
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, pipe.unet.parameters()),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+            eps=1e-8,
+        )
+        
+        # Create LR scheduler
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda epoch: get_lr_with_warmup(
+                epoch, config.warmup_epochs, 1.0, config.num_epochs
+            )
+        )
+    
+    # Encode prompt once
     print("\nEncoding prompt...")
     with torch.no_grad():
         prompt_embeds, _, pooled_prompt_embeds, _ = pipe.encode_prompt(
             prompt=config.prompt,
             device=device,
         )
-        # Keep embeddings in float16 for UNet
         prompt_embeds = prompt_embeds.to(dtype)
         pooled_prompt_embeds = pooled_prompt_embeds.to(dtype)
     
@@ -482,7 +567,7 @@ def train(config: TrainingConfig, resume_from: str = None):
     best_val_loss = float("inf")
     start_time = time.time()
     consecutive_nan = 0
-    max_consecutive_nan = 10  # Stop if too many NaN in a row
+    max_consecutive_nan = 10
     
     for epoch in range(start_epoch, config.num_epochs):
         epoch_start = time.time()
@@ -491,21 +576,29 @@ def train(config: TrainingConfig, resume_from: str = None):
         # Shuffle training data
         random.shuffle(train_pairs)
         
-        # Training epoch
+        # Training epoch with gradient accumulation
         epoch_loss = 0
         valid_batches = 0
         nan_count = 0
+        accumulated_loss = 0
+        accumulation_step = 0
+        
+        # Zero gradients at start of epoch
+        optimizer.zero_grad()
         
         pbar = tqdm(train_pairs, desc=f"Epoch {epoch+1}/{config.num_epochs}")
         
-        for pair in pbar:
-            optimizer.zero_grad()
+        for step, pair in enumerate(pbar):
+            # Get stratified timestep for lower variance
+            timesteps = get_stratified_timestep(
+                step, config.num_timestep_buckets, config.max_timestep, device
+            )
             
             # Compute loss
             loss, is_valid = compute_loss(
                 pipe, pair["original"], pair["compressed"],
                 prompt_embeds, pooled_prompt_embeds, add_time_ids,
-                device, dtype, use_amp=use_amp
+                device, dtype, timesteps, use_amp=use_amp
             )
             
             if not is_valid:
@@ -516,28 +609,68 @@ def train(config: TrainingConfig, resume_from: str = None):
                 if consecutive_nan >= max_consecutive_nan:
                     print(f"\n\nERROR: {max_consecutive_nan} consecutive NaN losses!")
                     print("Training is unstable. Try:")
-                    print("  1. Lower learning rate: --lr 1e-6")
+                    print("  1. Lower learning rate: --lr 5e-6")
                     print("  2. Check your training images for corruption")
                     return
                 continue
             
-            consecutive_nan = 0  # Reset counter on valid loss
+            consecutive_nan = 0
             
-            # Backward pass with gradient scaling
+            # Scale loss by accumulation steps
+            scaled_loss = loss / config.gradient_accumulation_steps
+            
+            # Backward pass (accumulate gradients)
             if scaler:
-                scaler.scale(loss).backward()
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+            
+            accumulated_loss += loss.item()
+            accumulation_step += 1
+            
+            # Step optimizer every gradient_accumulation_steps
+            if accumulation_step >= config.gradient_accumulation_steps:
+                if scaler:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(pipe.unet.parameters(), config.gradient_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(pipe.unet.parameters(), config.gradient_clip)
+                    optimizer.step()
+                
+                optimizer.zero_grad()
+                
+                # Track loss for this accumulated batch
+                avg_accumulated_loss = accumulated_loss / accumulation_step
+                epoch_loss += avg_accumulated_loss
+                valid_batches += 1
+                
+                pbar.set_postfix({
+                    "loss": f"{avg_accumulated_loss:.4f}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}"
+                })
+                
+                # Reset accumulation
+                accumulated_loss = 0
+                accumulation_step = 0
+        
+        # Handle remaining accumulated gradients at end of epoch
+        if accumulation_step > 0:
+            if scaler:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(pipe.unet.parameters(), config.gradient_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
                 torch.nn.utils.clip_grad_norm_(pipe.unet.parameters(), config.gradient_clip)
                 optimizer.step()
             
-            epoch_loss += loss.item()
+            optimizer.zero_grad()
+            
+            avg_accumulated_loss = accumulated_loss / accumulation_step
+            epoch_loss += avg_accumulated_loss
             valid_batches += 1
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         
         # Compute average training loss
         avg_train_loss = epoch_loss / valid_batches if valid_batches > 0 else float("nan")
@@ -549,7 +682,7 @@ def train(config: TrainingConfig, resume_from: str = None):
             val_loss = validate(
                 pipe, val_pairs,
                 prompt_embeds, pooled_prompt_embeds, add_time_ids,
-                device, dtype
+                device, dtype, config
             )
             
             if not math.isnan(val_loss) and val_loss < best_val_loss:
@@ -661,13 +794,13 @@ Examples:
     uv run python src/training_pipeline/train.py --data training_data
 
     # Custom epochs and learning rate
-    uv run python src/training_pipeline/train.py --data training_data --epochs 50 --lr 1e-5
+    uv run python src/training_pipeline/train.py --data training_data --epochs 100 --lr 1e-5
 
     # Resume from checkpoint
     uv run python src/training_pipeline/train.py --data training_data --resume lora_output/checkpoint-20
 
     # Higher LoRA rank for more capacity
-    uv run python src/training_pipeline/train.py --data training_data --rank 64
+    uv run python src/training_pipeline/train.py --data training_data --rank 64 --alpha 128
         """
     )
     
@@ -681,10 +814,14 @@ Examples:
                         help="Learning rate (default: 1e-5)")
     parser.add_argument("--rank", type=int, default=32,
                         help="LoRA rank (default: 32)")
+    parser.add_argument("--alpha", type=int, default=64,
+                        help="LoRA alpha (default: 64)")
+    parser.add_argument("--accum", type=int, default=8,
+                        help="Gradient accumulation steps (default: 8)")
     parser.add_argument("--save-every", type=int, default=20,
                         help="Save checkpoint every N epochs (default: 20)")
-    parser.add_argument("--val-every", type=int, default=10,
-                        help="Validate every N epochs (default: 10)")
+    parser.add_argument("--val-every", type=int, default=5,
+                        help="Validate every N epochs (default: 5)")
     parser.add_argument("--warmup", type=int, default=5,
                         help="Warmup epochs (default: 5)")
     parser.add_argument("--seed", type=int, default=42,
@@ -702,7 +839,8 @@ Examples:
         num_epochs=args.epochs,
         learning_rate=args.lr,
         lora_rank=args.rank,
-        lora_alpha=args.rank,
+        lora_alpha=args.alpha,
+        gradient_accumulation_steps=args.accum,
         save_every=args.save_every,
         validate_every=args.val_every,
         warmup_epochs=args.warmup,
