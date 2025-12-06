@@ -1,3 +1,1 @@
-uv run python src/data_pipeline/generate_training_data.py --input dataset
-
-test from h100
+FINETUNED MODELS HERE: https://huggingface.co/markmusic/lfgd/tree/main
